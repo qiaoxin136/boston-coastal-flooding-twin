@@ -1,7 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import DeckGL from '@deck.gl/react';
 import type { DeckGLRef } from '@deck.gl/react';
-import { FlyToInterpolator, MapView, TerrainController } from '@deck.gl/core';
+import {
+  FlyToInterpolator,
+  MapController,
+  MapView,
+  WebMercatorViewport,
+} from '@deck.gl/core';
 import type { MapViewState, PickingInfo } from '@deck.gl/core';
 import { MVTLayer, Tile3DLayer } from '@deck.gl/geo-layers';
 import { ScatterplotLayer, TextLayer } from '@deck.gl/layers';
@@ -42,6 +47,96 @@ import type {
 
 const INITIAL_BOOKMARK = CAMERA_BOOKMARKS[0];
 const FEET_TO_METERS = 0.3048006096;
+
+// Boston coastal streets sit ~26 m below the WGS84 ellipsoid (geoid N ≈ -28.3 m + ~2.3 m street height).
+// Anchoring MapController analytically to z = -26 m enables street-level zoom with zero GPU depth-picking cost.
+const BOSTON_STREET_WGS84_Z = -26;
+
+let cachedStreetPlaneState: MapController['ControllerState'] | null = null;
+
+class StreetPlaneMapController extends MapController {
+  constructor(props: ConstructorParameters<typeof MapController>[0]) {
+    super(props);
+    if (!cachedStreetPlaneState) {
+      const BaseMapState = this.ControllerState;
+      type BaseMapStateInstance = InstanceType<typeof BaseMapState>;
+
+      class StreetPlaneMapState extends BaseMapState {
+        override _unproject(
+          pos?: [number, number]
+        ): [number, number] | undefined {
+          if (!pos) return undefined;
+          const vpProps = this.getViewportProps();
+          const viewport = this.makeViewport(vpProps);
+          const targetZ = vpProps.position?.[2] ?? 0;
+          const coord = viewport.unproject(pos, { targetZ });
+          return coord ? [coord[0], coord[1]] : undefined;
+        }
+
+        override pan(
+          {
+            pos,
+            startPos,
+          }: { pos: [number, number]; startPos?: [number, number] },
+          constraintContext?: Parameters<BaseMapStateInstance['pan']>[1]
+        ): BaseMapStateInstance {
+          const startPanLngLat =
+            this.getState().startPanLngLat || this._unproject(startPos);
+          if (!startPanLngLat) return this;
+          const vpProps = this.getViewportProps();
+          const viewport = this.makeViewport(vpProps) as WebMercatorViewport;
+          const targetZ = vpProps.position?.[2] ?? 0;
+          const newProps = viewport.panByPosition3D(
+            [startPanLngLat[0], startPanLngLat[1], targetZ],
+            pos
+          );
+          return this._getUpdatedState(newProps, constraintContext);
+        }
+
+        override zoom(
+          {
+            pos,
+            startPos,
+            scale,
+          }: {
+            pos: [number, number];
+            startPos?: [number, number];
+            scale: number;
+          },
+          constraintContext?: Parameters<BaseMapStateInstance['zoom']>[1]
+        ): BaseMapStateInstance {
+          let { startZoom, startZoomLngLat } = this.getState();
+          if (!startZoomLngLat) {
+            startZoom = this.getViewportProps().zoom;
+            startZoomLngLat = this._unproject(startPos) || this._unproject(pos);
+          }
+          if (!startZoomLngLat) return this;
+          const constrained = this._getUpdatedState(
+            {
+              zoom:
+                (startZoom ?? this.getViewportProps().zoom) + Math.log2(scale),
+            },
+            constraintContext
+          );
+          const zoomedProps = constrained.getViewportProps();
+          const viewport = this.makeViewport(zoomedProps) as WebMercatorViewport;
+          const targetZ = zoomedProps.position?.[2] ?? 0;
+          const anchored = viewport.panByPosition3D(
+            [startZoomLngLat[0], startZoomLngLat[1], targetZ],
+            pos
+          );
+          return this._getUpdatedState(
+            { zoom: zoomedProps.zoom, ...anchored },
+            constraintContext
+          );
+        }
+      }
+
+      cachedStreetPlaneState = StreetPlaneMapState;
+    }
+    this.ControllerState = cachedStreetPlaneState;
+  }
+}
 
 interface SvBeaconDatum {
   position: [number, number];
@@ -216,9 +311,10 @@ export const App: React.FC = () => {
     zoom: INITIAL_BOOKMARK.zoom,
     pitch: INITIAL_BOOKMARK.pitch,
     bearing: INITIAL_BOOKMARK.bearing,
-    maxPitch: 88,
+    position: [0, 0, BOSTON_STREET_WGS84_Z],
+    maxPitch: 80,
     minZoom: 11,
-    maxZoom: 24,
+    maxZoom: 23.5,
   });
 
   const [activeBookmarkId, setActiveBookmarkId] = useState<string | null>(
@@ -415,6 +511,8 @@ export const App: React.FC = () => {
     svTarget.longitude,
   ]);
 
+  const lastCursorTsRef = useRef<number>(0);
+
   const extractCellFromPick = useCallback(
     (info: PickingInfo, pinned: boolean): InspectedCell | null => {
       const feature = info.object as
@@ -427,9 +525,18 @@ export const App: React.FC = () => {
       if (rawDepth < minDepthFt) {
         return null;
       }
-      const coord = info.coordinate;
-      const lon = coord ? coord[0] : viewState.longitude;
-      const lat = coord ? coord[1] : viewState.latitude;
+      const groundCoord = info.viewport
+        ? info.viewport.unproject([info.x, info.y], {
+            targetZ: BOSTON_STREET_WGS84_Z,
+          })
+        : info.coordinate;
+      const mercatorVp = info.viewport as WebMercatorViewport | undefined;
+      const lon = groundCoord
+        ? groundCoord[0]
+        : (mercatorVp?.longitude ?? INITIAL_BOOKMARK.longitude);
+      const lat = groundCoord
+        ? groundCoord[1]
+        : (mercatorVp?.latitude ?? INITIAL_BOOKMARK.latitude);
       return {
         depthFt: rawDepth,
         depthM: rawDepth * FEET_TO_METERS,
@@ -439,19 +546,28 @@ export const App: React.FC = () => {
         pinned,
       };
     },
-    [colorMode, minDepthFt, viewState.latitude, viewState.longitude]
+    [colorMode, minDepthFt]
   );
 
   const handleHover = useCallback(
     (info: PickingInfo) => {
-      if (info.coordinate && info.coordinate.length >= 2) {
-        setCursorCoords([info.coordinate[0], info.coordinate[1]]);
+      const now = performance.now();
+      if (now - lastCursorTsRef.current >= 80) {
+        const groundCoord = info.viewport
+          ? info.viewport.unproject([info.x, info.y], {
+              targetZ: BOSTON_STREET_WGS84_Z,
+            })
+          : info.coordinate;
+        if (groundCoord && groundCoord.length >= 2) {
+          lastCursorTsRef.current = now;
+          setCursorCoords([groundCoord[0], groundCoord[1]]);
+        }
       }
       if (info.layer?.id === 'boston-500yr-flood' && info.picked) {
         const cell = extractCellFromPick(info, false);
         setHoveredCell(cell);
       } else {
-        setHoveredCell(null);
+        setHoveredCell((prev) => (prev === null ? prev : null));
       }
     },
     [extractCellFromPick]
@@ -459,9 +575,14 @@ export const App: React.FC = () => {
 
   const handleClick = useCallback(
     (info: PickingInfo) => {
+      const groundCoord = info.viewport
+        ? info.viewport.unproject([info.x, info.y], {
+            targetZ: BOSTON_STREET_WGS84_Z,
+          })
+        : info.coordinate;
       const clickedCoord =
-        info.coordinate && info.coordinate.length >= 2
-          ? ([info.coordinate[0], info.coordinate[1]] as [number, number])
+        groundCoord && groundCoord.length >= 2
+          ? ([groundCoord[0], groundCoord[1]] as [number, number])
           : null;
 
       if (streetViewOpen && clickedCoord) {
@@ -542,7 +663,6 @@ export const App: React.FC = () => {
         },
       },
       operation: 'terrain+draw',
-      pickable: true,
       onTilesetLoad: () => {
         setTiles3dReady(true);
         setTileError(null);
@@ -695,7 +815,6 @@ export const App: React.FC = () => {
       new MapView({
         id: 'main',
         nearZMultiplier: 0.02,
-        farZMultiplier: 10,
       }),
     []
   );
@@ -767,15 +886,15 @@ export const App: React.FC = () => {
             }
           }}
           controller={{
-            type: TerrainController,
+            type: StreetPlaneMapController,
             touchRotate: true,
             inertia: 250,
           }}
           layers={layers}
           onHover={handleHover}
           onClick={handleClick}
-          getCursor={({ isDragging }) =>
-            isDragging ? 'grabbing' : hoveredCell ? 'crosshair' : 'grab'
+          getCursor={({ isHovering, isDragging }) =>
+            isDragging ? 'grabbing' : isHovering ? 'crosshair' : 'grab'
           }
         />
 
