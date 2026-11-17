@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import DeckGL from '@deck.gl/react';
 import type { DeckGLRef } from '@deck.gl/react';
-import { FlyToInterpolator } from '@deck.gl/core';
+import { FlyToInterpolator, MapView, TerrainController } from '@deck.gl/core';
 import type { MapViewState, PickingInfo } from '@deck.gl/core';
 import { MVTLayer, Tile3DLayer } from '@deck.gl/geo-layers';
 import { ScatterplotLayer, TextLayer } from '@deck.gl/layers';
@@ -216,9 +216,9 @@ export const App: React.FC = () => {
     zoom: INITIAL_BOOKMARK.zoom,
     pitch: INITIAL_BOOKMARK.pitch,
     bearing: INITIAL_BOOKMARK.bearing,
-    maxPitch: 85,
+    maxPitch: 88,
     minZoom: 11,
-    maxZoom: 20,
+    maxZoom: 24,
   });
 
   const [activeBookmarkId, setActiveBookmarkId] = useState<string | null>(
@@ -542,6 +542,7 @@ export const App: React.FC = () => {
         },
       },
       operation: 'terrain+draw',
+      pickable: true,
       onTilesetLoad: () => {
         setTiles3dReady(true);
         setTileError(null);
@@ -689,6 +690,16 @@ export const App: React.FC = () => {
     return [pointLayer, labelLayer];
   }, [streetViewOpen, svTarget.latitude, svTarget.longitude]);
 
+  const mainMapView = useMemo(
+    () =>
+      new MapView({
+        id: 'main',
+        nearZMultiplier: 0.02,
+        farZMultiplier: 10,
+      }),
+    []
+  );
+
   const layers = useMemo(
     () => [...baseLayers, ...svBeaconLayers],
     [baseLayers, svBeaconLayers]
@@ -729,6 +740,7 @@ export const App: React.FC = () => {
       <div className="map-pane">
         <DeckGL
           ref={deckRef}
+          views={mainMapView}
           viewState={viewState}
           onViewStateChange={({ viewState: nextVs, interactionState }) => {
             const vs = nextVs as MapViewState;
@@ -755,14 +767,15 @@ export const App: React.FC = () => {
             }
           }}
           controller={{
+            type: TerrainController,
             touchRotate: true,
             inertia: 250,
           }}
           layers={layers}
           onHover={handleHover}
           onClick={handleClick}
-          getCursor={({ isHovering, isDragging }) =>
-            isDragging ? 'grabbing' : isHovering ? 'crosshair' : 'grab'
+          getCursor={({ isDragging }) =>
+            isDragging ? 'grabbing' : hoveredCell ? 'crosshair' : 'grab'
           }
         />
 
