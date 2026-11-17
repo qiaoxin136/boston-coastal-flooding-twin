@@ -260,5 +260,5 @@ export function buildMapboxTileJsonUrl(
 ): string {
   const cleanId = tilesetId.trim();
   const cleanToken = accessToken.trim();
-  return `https://api.mapbox.com/v4/${cleanId}.json?access_token=${encodeURIComponent(cleanToken)}`;
+  return `https://api.mapbox.com/v4/${cleanId}.json?secure&access_token=${encodeURIComponent(cleanToken)}`;
 }
